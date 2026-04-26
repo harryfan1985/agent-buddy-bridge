@@ -25,7 +25,6 @@ from typing import Optional
 from .ble_central import BLECentral
 from .json_codec import NUSJSONCodec
 from .http_server import HTTPServer
-from .http_client import HermesHTTPClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,19 +47,23 @@ class HermesBuddyBridge:
         → BLE notification
         → BLECentral._handle_notification
         → prompt_id → session_key lookup
-        → HermesHTTPClient.post_decision(session_key, choice)
-        → ApprovalRelay (:8766)
+        → HermesHTTPServer._proxy_to_hermes() (PR #11812 merged)
+           OR HermesHTTPServer._proxy_to_relay() (fallback: Approval Relay)
         → Hermes resolve_gateway_approval()
     """
 
     def __init__(
         self,
         http_port: int = 8765,
+        hermes_approve_url: str = "http://localhost:8642",
         relay_url: str = "http://localhost:8766",
     ):
         self.ble = BLECentral()
-        self.http_server = HTTPServer(port=http_port)
-        self.gateway_client = HermesHTTPClient(gateway_url=relay_url)
+        self.http_server = HTTPServer(
+            port=http_port,
+            hermes_approve_url=hermes_approve_url,
+        )
+        self._relay_url = relay_url  # fallback
         self._running = False
 
         # prompt_id → session_key mapping (populated from Hermes state)
@@ -106,10 +109,48 @@ class HermesBuddyBridge:
             logger.warning(f"Unknown prompt_id: {prompt_id}, cannot resolve approval")
             return
 
-        # Send decision to ApprovalRelay → Hermes
+        # Send decision to Hermes:
+        # 1. PR #11812 merged → Hermes /internal/approve (primary)
+        # 2. Fallback → Approval Relay (:8766)
         asyncio.create_task(
-            self.gateway_client.post_decision(session_key, decision)
+            self._send_decision(session_key, decision)
         )
+
+    async def _send_decision(self, session_key: str, decision: str) -> None:
+        """Send button decision to Hermes (tries Hermes internal, then Relay fallback)."""
+        import aiohttp
+        # Try Hermes internal endpoint
+        hermes_url = self.http_server.hermes_approve_url
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{hermes_url}/internal/approve",
+                    json={"session_key": session_key, "choice": decision},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Decision approved via Hermes internal: {decision}")
+                        return
+        except Exception as e:
+            logger.debug(f"Hermes internal approve unavailable: {e}")
+
+        # Fallback: Approval Relay
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{self._relay_url}/approve",
+                    json={"session_key": session_key, "choice": decision},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        logger.info(
+                            f"Decision approved via Relay: {decision}, "
+                            f"resolved={result.get('resolved', '?')}"
+                        )
+                        return
+        except Exception as e:
+            logger.error(f"Approval Relay also unavailable: {e}")
 
     def _handle_hermes_state(self, state: dict, session_key: str) -> None:
         """
@@ -194,7 +235,6 @@ class HermesBuddyBridge:
         self._running = False
         await self.ble.disconnect()
         await self.http_server.stop()
-        await self.gateway_client.close()
         logger.info("Bridge stopped")
 
     async def run(self) -> None:
@@ -218,13 +258,18 @@ async def main() -> None:
         help="HTTP server port for Hermes webhook (default: 8765)"
     )
     parser.add_argument(
+        "--hermes-approve-url", default="http://localhost:8642",
+        help="Hermes internal approve URL (default: http://localhost:8642)"
+    )
+    parser.add_argument(
         "--relay-url", default="http://localhost:8766",
-        help="Approval relay URL (default: http://localhost:8766)"
+        help="Approval relay fallback URL (default: http://localhost:8766)"
     )
     args = parser.parse_args()
 
     bridge = HermesBuddyBridge(
         http_port=args.http_port,
+        hermes_approve_url=args.hermes_approve_url,
         relay_url=args.relay_url,
     )
 

@@ -1,0 +1,14 @@
+name: buddy-bridge
+version: 1.0.0
+description: |
+  M5StickC Plus BLE button approval for Hermes dangerous commands.
+  Registers pre_tool_call hook for BuddyBridge approval integration.
+
+  Requires PR #11812 ( NousResearch/hermes-agent ) to be merged for:
+  - platform_class support
+  - pre_tool_call {"action": "approve"} directive
+
+author: harryfan
+hooks:
+  - pre_tool_call
+provides_tools: []
