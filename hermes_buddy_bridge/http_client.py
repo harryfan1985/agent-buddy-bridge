@@ -31,31 +31,28 @@ class HermesHTTPClient:
             await self._session.close()
             self._session = None
 
-    async def post_decision(self, prompt_id: str, decision: str) -> bool:
+    async def post_decision(self, session_key: str, decision: str) -> bool:
         """
-        Post a permission decision to Hermes Gateway.
+        Post a button decision to the Approval Relay.
 
         Args:
-            prompt_id: The approval request ID
-            decision: "once" (approve) or "deny"
-
-        Returns:
-            True if successful, False otherwise
+            session_key: The approval session key
+            decision: "once", "deny", "always", or "session"
         """
         try:
             session = await self._get_session()
             payload = {
-                "cmd": "permission",
-                "id": prompt_id,
-                "decision": decision
+                "session_key": session_key,
+                "choice": decision
             }
             async with session.post(
-                f"{self.gateway_url}/buddy/decision",
+                f"{self.gateway_url}/approve",
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 if resp.status == 200:
-                    logger.info(f"Decision posted: {decision} for {prompt_id[:20]}")
+                    result = await resp.json()
+                    logger.info(f"Decision posted: {decision} → resolved={result.get('resolved', '?')}")
                     return True
                 else:
                     body = await resp.text()

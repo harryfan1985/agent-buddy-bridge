@@ -13,6 +13,8 @@ from typing import Optional, Callable
 from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
 
+from .json_codec import NUSJSONCodec
+
 logger = logging.getLogger(__name__)
 
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -72,19 +74,28 @@ class BLECentral:
             return False
         return await self.connect(devices[0])
 
-    def set_notification_callback(self, callback: Callable[[str], None]) -> None:
-        """Set callback for incoming BLE notifications."""
+    def set_notification_callback(self, callback: Callable[[dict], None]) -> None:
+        """
+        Set callback for incoming BLE notifications.
+
+        Callback receives decoded JSON dict (not raw string).
+        """
         self._notification_callback = callback
 
     def _handle_notification(self, sender: int, data: bytearray) -> None:
-        """Handle incoming BLE notification data."""
+        """Handle incoming BLE notification data, decode JSON and dispatch."""
         try:
-            text = data.decode("utf-8")
-            logger.debug(f"BLE RX: {text[:100]}")
+            text = data.decode("utf-8").strip()
+            if not text:
+                return
+
+            # Try to decode as JSON; if invalid, still dispatch raw text
+            msg = NUSJSONCodec.decode_message(text)
+            logger.debug(f"[BLE RX] {text[:80]}{'...' if len(text) > 80 else ''}")
             if self._notification_callback:
-                self._notification_callback(text)
+                self._notification_callback(msg or {"raw": text})
         except Exception as e:
-            logger.error(f"Failed to decode notification: {e}")
+            logger.error(f"Failed to handle BLE notification: {e}")
 
     async def write(self, data: str) -> bool:
         """Write data to the NUS RX characteristic."""

@@ -27,8 +27,11 @@ class HTTPServer:
         self._state_callback: Optional[Callable[[dict], None]] = None
         self._status_callback: Optional[Callable[[], dict]] = None
 
-    def set_state_callback(self, callback: Callable[[dict], None]) -> None:
-        """Set callback for incoming state updates."""
+    def set_state_callback(self, callback: Callable[[dict, str], None]) -> None:
+        """Set callback for incoming state updates.
+
+        Callback signature: (state: dict, session_key: str) -> None
+        """
         self._state_callback = callback
 
     def set_status_callback(self, callback: Callable[[], dict]) -> None:
@@ -39,14 +42,25 @@ class HTTPServer:
         """
         POST /buddy/state
 
-        Receives session state from Hermes Gateway.
+        Receives session state from Hermes Gateway (via BuddyAdapter webhook).
         Forwards to M5StickC via BLE.
+
+        Headers:
+            X-Session-Key: Hermes approval session key (for correlation)
+
+        Body: Session State JSON (Claude Desktop Buddy heartbeat format)
         """
         try:
+            # Extract session key from header for button correlation
+            session_key = request.headers.get("X-Session-Key", "")
+
             data = await request.json()
-            logger.debug(f"Received state: {str(data)[:200]}")
+            logger.debug(f"Received state: {str(data)[:200]}, session_key={session_key[:20] if session_key else '?'}")
+
             if self._state_callback:
-                self._state_callback(data)
+                # Pass both state and session_key to callback
+                self._state_callback(data, session_key)
+
             return web.json_response({"status": "ok"})
         except Exception as e:
             logger.error(f"State handler error: {e}")
