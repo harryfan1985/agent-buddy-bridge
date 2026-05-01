@@ -1,154 +1,134 @@
 # Agent Buddy Bridge - 项目状态与 TODO
 
-## 当前状态
+## 当前状态：v0.12.0 就绪
+
+**核心审批链路已打通。** Hermes v0.12.0 合并的 hooks 和 platform_registry 填补了之前所有的关键空白。
+
+### Hermes 接口能力 (v0.12.0)
+
+| # | 能力 | 状态 | PR |
+|---|------|------|----|
+| 1 | `pre_approval_request` hook | ✅ 已合并 | [#16776](https://github.com/NousResearch/hermes-agent/pull/16776) (2026-04-28) |
+| 2 | `post_approval_response` hook | ✅ 已合并 | [#16776](https://github.com/NousResearch/hermes-agent/pull/16776) |
+| 3 | Plugin 注册平台适配器 (`platform_registry`) | ✅ 内置 | IRC/Teams 插件即范例 |
+| 4 | `resolve_gateway_approval()` | ✅ 一直可用 | — |
+| 5 | Session 清理时唤醒阻塞审批 | ✅ 已合并 | [#18171](https://github.com/NousResearch/hermes-agent/pull/18171) (2026-05-01) |
 
 ### 已验证可工作的组件
 
 | 组件 | 端口 | 状态 |
 |------|------|------|
-| BuddyBridge HTTP Server | 8765 | ✅ 运行中 |
-| Approval Relay | 8766 | ✅ 运行中，`hermes_loaded: true` |
-| BLE Central (Claude-0C1E) | - | ✅ 已连接 |
-| Fallback 路径测试 | - | ✅ `via: approval-relay` |
+| BuddyBridge HTTP Server | 8765 | ✅ 可运行 |
+| Approval Relay | 8766 | ✅ 可运行，`hermes_loaded: true` |
+| BLE Central (Claude-0C1E) | — | ✅ 已连接 |
+| Fallback 路径测试 | — | ✅ `via: approval-relay` |
+| pre_approval_request hook 触发 | — | ✅ session_key 可用 |
+| plugin.yaml 注册 | — | ✅ Hermes 可发现 |
 
-### 已验证的功能
+### 已解决的旧问题
 
-1. **BLE 扫描与连接** ✅
-   - `Claude-0C1E` 设备发现成功
-   - NUS Service (6e400001-b5a3-f393-e0a9-e50e24dcca9e) 确认
-   - TX/RX Characteristics 可用
+| 旧问题 | 解决方案 |
+|--------|---------|
+| "M5StickC 不知道何时有审批" | `pre_approval_request` hook 主动推送 `{command, session_key}` |
+| "session_key 无法从外部获取" | hook 回调携带 session_key |
+| ""手动模式"不可行" | **已可行** — hook 通知 + Approval Relay 审批 = 完整闭环 |
+| "需要 /internal/approve HTTP 端点" | 不再需要 — Approval Relay 直接调用 `resolve_gateway_approval()` |
 
-2. **Approval Relay** ✅
-   - 成功导入 `resolve_gateway_approval`
-   - `POST /approve {session_key, choice}` 端点可用
-   - Fallback 路径 (`/internal/approve` → `:8766`) 已验证
+---
 
-3. **BuddyBridge HTTP Server** ✅
-   - `POST /buddy/state` 接收 Hermes 状态
-   - `GET /buddy/status` 返回设备状态
-   - `pending_prompts` 追踪正常
+## 剩余工作
 
-## 无法打通的原因
+### P1: BuddyPlatformAdapter 适配 `pre_approval_request` hook
 
-### 核心瓶颈：PR #11812 未合并
+**当前状态：** `platform.py` 中的 `BuddyPlatformAdapter` 基于旧架构设计（`send_exec_approval()` + `approval_callback`），尚未适配新的 hook 驱动架构。
 
-完整双向链路需要：
+**需要的变更：**
 
-```
-Hermes → M5StickC: Hermes 发送审批请求（显示在设备屏幕上）
-M5StickC → Hermes: 按钮审批（批准/拒绝）
-```
+1. **`hermes_plugin/__init__.py`** — 注册 `pre_approval_request` hook（替换/补充现有的 `pre_tool_call` hook）：
+   ```python
+   def register(ctx):
+       ctx.register_hook("pre_approval_request", _on_pre_approval_request)
+       ctx.register_hook("post_approval_response", _on_post_approval_response)
+   ```
 
-| 路径 | 方向 | 依赖 | 状态 |
-|------|------|------|------|
-| Hermes → M5StickC (显示审批) | → | `BuddyPlatformAdapter` + PR #11812 | ❌ |
-| M5StickC → Hermes (按钮审批) | ← | Approval Relay | ✅ (但无法自动触发) |
+2. **`hermes_plugin/plugin.yaml`** — 更新 hooks 列表：
+   ```yaml
+   hooks:
+     - pre_approval_request
+     - post_approval_response
+   ```
 
-### "手动模式"方案分析（不可行）
+3. **Hook 实现**：
+   ```python
+   async def _on_pre_approval_request(command, session_key, pattern_key, surface, **kwargs):
+       """审批请求时推送状态到 BuddyBridge → M5StickC"""
+       # POST /buddy/state to http://localhost:8765
+       # Body: {command, session_key, pattern_key, surface}
 
-尝试方案：M5StickC 看到审批后，通过 Approval Relay HTTP 端点注入审批结果。
+   async def _on_post_approval_response(choice, command, session_key, **kwargs):
+       """审批完成后清理 M5StickC 屏幕"""
+       # POST /buddy/clear or similar to http://localhost:8765
+   ```
 
-**不可行的原因：**
+4. **`http_server.py`** — 确保 `/buddy/state` 端点能接收 hook 推送的数据格式。
 
-1. **无通知通道** — Hermes 没有 BuddyPlatformAdapter 时，不会主动发送审批状态到任何外部系统。M5StickC 不知道何时有审批需要处理。
+### P2: 端到端集成测试
 
-2. **session_key 无法获取** — `resolve_gateway_approval(session_key, choice)` 需要正确的 session_key。Hermes 的 `_pending_approvals` 是内部 dict，不暴露 API。无法自动发现当前等待审批的 session。
+- [ ] 触发真实危险命令 → M5StickC 屏幕显示审批提示
+- [ ] M5StickC 按钮 → Approval Relay → agent 解除阻塞
+- [ ] Telegram `/approve` 和 M5StickC 按钮并发 → 先到先得
+- [ ] 超时 → 自动 deny → M5StickC 屏幕清理
+- [ ] `/new` 重置 session → 阻塞审批自动 deny（PR #18171）
 
-3. **双重等待冲突** — Hermes 会同时等待自己的 `/approve` 命令。即使 Approval Relay 注入了审批，Hermes 原生审批 UI 也会超时。
+### P3: Optional — 等待 PR #11816 合并
 
-**结论：** 在不修改 Hermes 代码的情况下，无法打通从 M5StickC 按钮到 Hermes 审批的完整链路。
-
-## 依赖的 PR
-
-| PR | 内容 | 状态 |
+| PR | 功能 | 影响 |
 |----|------|------|
-| [#11812](https://github.com/NousResearch/hermes-agent/issues/11812) | `pre_tool_call approve` action + `platform_class` 支持 | ❌ 未合并 |
-| [#11816](https://github.com/NousResearch/hermes-agent/pull/11816) | BuddyAdapter 实现 | ❌ 未合并 |
+| [#11816](https://github.com/NousResearch/hermes-agent/pull/11816) | `pre_tool_call {"action": "approve"}` 指令 + `"plugin"` 审批模式 | 白名单命令自动放行，不触发 Telegram/M5StickC 审批 |
 
-## 下一步
+**不影响核心链路。** 仅用于 UX 优化（静默放行已知安全命令）。
 
-1. **等待 PR #11812 合并** — 合并后配置 `platforms.buddy` 即可完整打通
-2. **PR 合并后的升级步骤：**
-   - 更新 Hermes 到最新版本
-   - 配置 `platforms.buddy` 和 `plugins.enabled`
-   - 重启 Hermes gateway
-   - 验证完整双向链路
+---
 
-## 架构图（目标状态）
+## 审批流程（当前 v0.12.0 的实际路径）
 
 ```
-M5StickC Plus (BLE Peripheral, Claude Desktop Buddy firmware)
-       ↕ BLE NUS (Nordic UART Service)
-BLECentral (ble_central.py, bleak/CoreBluetooth)
-       ↓ JSON over BLE
-HTTPServer (:8765) ← POST /buddy/state + X-Session-Key header
-       ↑
-       Hermes BuddyPlatformAdapter.send_exec_approval()
-       (via platform_class: "agent_buddy_bridge.platform.BuddyPlatformAdapter")
-       ↑ Hermes Gateway
-       Hermes AIAgent + approval_callback
+Dangerous command detected
+    ↓
+approval.py: prompt_dangerous_approval()
+    ├─→ pre_approval_request hook → Plugin → Bridge → BLE → M5StickC
+    ├─→ Telegram notification (simultaneous)
+    └─→ Agent thread blocks
 
-M5StickC Button Press
-       ↕ BLE notification
-BLECentral._handle_notification()
-       ↓
-prompt_id → session_key lookup
-       ↓ POST /internal/approve {session_key, choice}
-HTTPServer.handle_internal_approve()
-       ↓ (PR #11812 merged)
-Hermes /internal/approve → resolve_gateway_approval()
-       ↓ (fallback without PR #11812)
-Approval Relay (:8766) → resolve_gateway_approval()
+M5StickC button OR Telegram /approve
+    ↓
+resolve_gateway_approval(session_key, "once")
+    ↓
+event.set() → Agent unblocked
+    ↓
+post_approval_response hook → Clean M5StickC screen
 ```
 
-## 配置摘要
-
-### BuddyBridge (后台进程)
-
-```bash
-# BuddyBridge HTTP Server
-cd ~/code/agent-buddy-bridge && ~/.hermes/hermes-agent/venv/bin/python -m hermes_buddy_bridge.main \
-    --http-port 8765 \
-    --hermes-approve-url http://localhost:8642 \
-    --relay-url http://localhost:8766
-
-# Approval Relay (fallback)
-cd ~/code/agent-buddy-bridge && ~/.hermes/hermes-agent/venv/bin/python -m hermes_buddy_bridge.approval_relay \
-    --hermes-home ~/.hermes \
-    --port 8766
-```
-
-### Hermes 配置（PR #11812 合并后添加）
-
-```yaml
-platforms:
-  buddy:
-    enabled: true
-    platform_class: "agent_buddy_bridge.platform.BuddyPlatformAdapter"
-    bridge_url: "http://localhost:8765"
-    hermes_approve_url: "http://localhost:8642"
-
-plugins:
-  enabled:
-    - buddy-bridge
-```
+---
 
 ## 文件结构
 
 ```
 agent-buddy-bridge/
-├── README.md
-├── LICENSE
-├── requirements.txt          # bleak, aiohttp
-├── hermes_plugin/           # Hermes Plugin (pre_tool_call hook)
-│   ├── __init__.py
-│   └── plugin.yaml
-└── hermes_buddy_bridge/    # BuddyBridge main program
-     ├── __init__.py
-     ├── platform.py         # BuddyPlatformAdapter + BuddyApprovalCallback
-     ├── ble_central.py      # BLE Central (bleak, macOS CoreBluetooth)
-     ├── json_codec.py       # NUS JSON encode/decode
-     ├── http_server.py      # HTTP server (:8765, state + /internal/approve)
-     ├── approval_relay.py   # Approval Relay (:8766, fallback)
-     └── main.py             # Bridge entry point
+├── README.md                   # 安装/使用/验证/排错完整指南
+├── TODO.md                     # 本文件
+├── LICENSE                     # MIT
+├── requirements.txt            # bleak, aiohttp
+├── hermes_plugin/              # Hermes Plugin
+│   ├── __init__.py             # register() + hooks
+│   └── plugin.yaml             # 插件元数据
+└── hermes_buddy_bridge/        # BuddyBridge 主程序
+    ├── __init__.py
+    ├── platform.py             # BuddyPlatformAdapter
+    ├── ble_central.py          # BLE Central (bleak)
+    ├── json_codec.py           # NUS JSON 编解码
+    ├── http_server.py          # HTTP 服务器 (:8765)
+    ├── approval_relay.py       # Approval Relay (:8766)
+    ├── http_client.py          # HTTP 客户端
+    └── main.py                 # 入口程序
 ```
