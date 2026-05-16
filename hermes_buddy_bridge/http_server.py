@@ -1,12 +1,16 @@
 """
-HTTP Server module - receives session state from Hermes Gateway AND
-proxies button decisions to Hermes's internal approve endpoint.
+HTTP Server module - receives state from agent platforms and proxies approvals.
+
+Supports multiple agent platforms (Hermes, BitFun, etc.) via the
+PlatformBackend system. Resolution is handled by backends, not by this
+module. The /internal/approve endpoint is kept for backward compatibility.
 
 Endpoints:
-- POST /buddy/state - receives state updates from Hermes (forward to M5StickC)
+- POST /buddy/state - receives state updates from agent platforms → M5StickC
 - GET  /buddy/status - device status query
-- POST /internal/approve - button decisions → Hermes resolve_gateway_approval()
-                         (requires PR #11812 merged; falls back to Approval Relay)
+- GET  /health       - service health check
+- POST /internal/approve - (legacy) button decisions → Hermes
+                           Resolution now handled by backends in main.py
 """
 
 import asyncio
@@ -50,13 +54,15 @@ class HTTPServer:
         """
         POST /buddy/state
 
-        Receives session state from Hermes Gateway (via BuddyAdapter webhook).
+        Receives state from agent platforms (Hermes, BitFun, etc.).
         Forwards to M5StickC via BLE.
 
         Headers:
-            X-Session-Key: Hermes approval session key (for correlation)
+            X-Session-Key: Platform session key for button correlation
+                           (Hermes uses this; BitFun may omit)
 
-        Body: Session State JSON (Claude Desktop Buddy heartbeat format)
+        Body: State JSON (Claude Desktop Buddy heartbeat format)
+              Must include {"prompt": {"id": "..."}} for button correlation.
         """
         try:
             # Extract session key from header for button correlation
