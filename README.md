@@ -1,11 +1,42 @@
 # Agent Buddy Bridge
 
-BLE Bridge connecting M5StickC Plus hardware buddy to Hermes Agent for physical button approvals.
+BLE Bridge connecting M5StickC Plus hardware buddy to AI agent platforms (Hermes Agent, BitFun ADE) for physical button approvals via a pluggable backend system.
 
 > **Hermes v0.12.0 ready.** Core approval hooks and platform plugin support are merged.
-> Only [PR #11816](https://github.com/NousResearch/hermes-agent/pull/11816) (`pre_tool_call approve`) remains open — and it's optional for the button approval flow.
+> **BitFun support added.** EventSubscriber-based integration via `--platforms bitfun`.
 
 ## Approval Flow
+
+The same M5StickC button can approve commands from multiple platforms simultaneously. Each platform registers a backend that handles resolution in its own protocol.
+
+```
+Hermes Agent                          BitFun ADE
+    │                                     │
+    ▼                                     ▼
+pre_approval_request hook            ConfirmationNeeded event
+    │                                     │
+    └──────────┬──────────────────────────┘
+               ▼
+         BuddyBridge (:8765)
+         PlatformBackend dispatch
+               │
+               ▼
+         BLE → M5StickC screen
+               │
+               ▼
+         Button press (BLE notify)
+               │
+     ┌─────────┴─────────┐
+     ▼                   ▼
+HermesBackend        BitFunBackend
+POST /internal       POST /buddy/approve
+→ resolve_gateway    → confirm_tool() / reject_tool()
+_approval()
+```
+
+**Two channels (M5StickC + Telegram), one goal.** First to arrive wins; the other is idempotent (returns 0).
+
+### Hermes-specific flow (legacy diagram)
 
 ```
 Dangerous command detected (e.g. rm -rf /data)
@@ -43,8 +74,6 @@ tools/approval.py: prompt_dangerous_approval()
         → Clean up M5StickC screen
         → Command executes
 ```
-
-**Two channels, one goal.** The user can approve from Telegram (at desk) or M5StickC button (away from desk). First to arrive wins; the other returns 0 (idempotent).
 
 ---
 
@@ -149,9 +178,21 @@ The bridge runs as **two processes**. Start them in separate terminals (or use `
 cd ~/code/agent-buddy-bridge
 
 # Must use SYSTEM Python (bleak requires pyobjc / CoreBluetooth)
+
+# Default: Hermes only (backward compatible)
 /usr/bin/python3 -m hermes_buddy_bridge.main \
     --http-port 8765 \
     --relay-url http://localhost:8766
+
+# Or: Hermes + BitFun dual-platform
+/usr/bin/python3 -m hermes_buddy_bridge.main \
+    --platforms hermes,bitfun \
+    --bitfun-url http://localhost:48765
+
+# Or: BitFun only
+/usr/bin/python3 -m hermes_buddy_bridge.main \
+    --platforms bitfun \
+    --bitfun-url http://localhost:48765
 ```
 
 Expected output:
@@ -189,9 +230,14 @@ Approval relay listening on http://localhost:8766
 ### Running as background services
 
 ```bash
-# BuddyBridge (system Python)
+# BuddyBridge (system Python) — Hermes only
 nohup /usr/bin/python3 -m hermes_buddy_bridge.main \
     --http-port 8765 --relay-url http://localhost:8766 \
+    > ~/.hermes/logs/buddy-bridge.log 2>&1 &
+
+# BuddyBridge (system Python) — Hermes + BitFun
+nohup /usr/bin/python3 -m hermes_buddy_bridge.main \
+    --platforms hermes,bitfun --bitfun-url http://localhost:48765 \
     > ~/.hermes/logs/buddy-bridge.log 2>&1 &
 
 # Approval Relay (Hermes venv Python)
@@ -279,12 +325,28 @@ Expected:
 
 | Port | Method | Path | Direction | Body |
 |------|--------|------|-----------|------|
-| 8765 | POST | `/buddy/state` | Hermes → Bridge | Session state + `X-Session-Key` (from `pre_approval_request` hook) |
+| 8765 | POST | `/buddy/state` | Platforms → Bridge | State JSON + `X-Session-Key` (from approval hook / event subscriber) |
 | 8765 | GET | `/buddy/status` | Health check | — |
 | 8765 | GET | `/health` | Bridge health | — |
-| 8765 | POST | `/internal/approve` | Bridge → Relay | `{"session_key", "choice"}` → relay (:8766) |
-| 8766 | POST | `/approve` | Relay receive | `{"session_key", "choice"}` → `resolve_gateway_approval()` |
+| 8765 | POST | `/internal/approve` | Bridge → Relay (legacy) | `{"session_key", "choice"}` → relay (:8766) |
+| 8766 | POST | `/approve` | Relay receive (Hermes) | `{"session_key", "choice"}` → `resolve_gateway_approval()` |
 | 8766 | GET | `/health` | Relay health | — |
+| 48765 | POST | `/buddy/approve` | Bridge → BitFun | `{"tool_id", "choice"}` → `confirm_tool()` / `reject_tool()` |
+| 48765 | GET | `/health` | BitFun bridge health | — |
+
+## CLI Reference
+
+```
+/usr/bin/python3 -m hermes_buddy_bridge.main [options]
+
+Options:
+  --http-port PORT           HTTP server port (default: 8765)
+  --platforms P1,P2,...      Comma-separated platform list: hermes, bitfun
+                             (default: hermes)
+  --hermes-approve-url URL   Hermes internal approve URL (default: http://localhost:8642)
+  --relay-url URL            Approval Relay fallback URL (default: http://localhost:8766)
+  --bitfun-url URL           BitFun callback endpoint URL (default: http://localhost:48765)
+```
 
 ---
 
@@ -409,32 +471,52 @@ echo "=== Done ==="
 M5StickC Plus (BLE Peripheral, Claude Desktop Buddy firmware)
     ↕ BLE NUS (Nordic UART Service)
 BLECentral (ble_central.py, bleak/CoreBluetooth)
-    ↓ JSON over BLE
+    ↕ JSON over BLE
 HTTPServer (:8765)
-    ↑ POST /buddy/state (Hermes → Bridge, from pre_approval_request hook)
-    ↓ POST /internal/approve (Bridge → Hermes, on button press)
-    ↓
-Approval Relay (:8766) → resolve_gateway_approval(session_key, choice)
-    ↑
-    Hermes tools/approval.py
+    ↕ POST /buddy/state
+HermesBuddyBridge (main.py)
+    ↕ PlatformBackend dispatch
+├── HermesBackend → Hermes /internal/approve or Approval Relay (:8766)
+└── BitFunBackend → BitFun /buddy/approve (:48765)
+```
+
+### Platform Backends
+
+The bridge supports multiple agent platforms via a pluggable backend system. Each backend implements the `PlatformBackend` interface:
+
+| Backend | File | Resolution |
+|---------|------|------------|
+| **HermesBackend** | `backends/hermes_backend.py` | Two-path: Hermes `/internal/approve` → fallback Approval Relay `:8766` |
+| **BitFunBackend** | `backends/bitfun_backend.py` | POST `/buddy/approve` to BitFun's embedded HTTP callback server |
+
+Enable backends via `--platforms`:
+
+```bash
+# Hermes only (default — backward compatible)
+--platforms hermes
+
+# Both platforms
+--platforms hermes,bitfun --bitfun-url http://localhost:48765
+
+# BitFun only
+--platforms bitfun --bitfun-url http://localhost:48765
 ```
 
 ## Two-Process Design
 
 | Process | Python | Port | Role |
 |---------|--------|------|------|
-| **BuddyBridge** | `/usr/bin/python3` (system) | 8765 | BLE Central + HTTP server (Hermes ↔ M5StickC) |
-| **Approval Relay** | `~/.hermes/hermes-agent/venv/bin/python` | 8766 | Calls `resolve_gateway_approval()` directly |
+| **BuddyBridge** | `/usr/bin/python3` (system) | 8765 | BLE Central + HTTP server + PlatformBackend dispatch |
+| **Approval Relay** | `~/.hermes/hermes-agent/venv/bin/python` | 8766 | Calls `resolve_gateway_approval()` directly (Hermes only) |
 
-**Why two Pythons:** `bleak` requires system Python with `pyobjc` (CoreBluetooth). `resolve_gateway_approval()` requires Hermes venv.
-
-**Why the relay is needed (even in v0.12.0):** The button press arrives via BLE → `/internal/approve` on port 8765. There is no HTTP `/internal/approve` endpoint in Hermes gateway — `resolve_gateway_approval()` is a Python function. The relay bridges this gap by accepting HTTP and calling the function directly.
+**Why two Pythons:** `bleak` requires system Python with `pyobjc` (CoreBluetooth). `resolve_gateway_approval()` requires Hermes venv. BitFun does not need the Approval Relay — its backend calls BitFun's HTTP callback directly.
 
 ## Project Structure
 
 ```
 agent-buddy-bridge/
 ├── README.md
+├── TODO.md
 ├── LICENSE
 ├── requirements.txt              # bleak, aiohttp
 ├── hermes_plugin/                # Hermes Plugin (pre_approval_request hook)
@@ -442,20 +524,26 @@ agent-buddy-bridge/
 │   └── plugin.yaml
 └── hermes_buddy_bridge/          # BuddyBridge main program
     ├── __init__.py
+    ├── main.py                   # Bridge entry point, PlatformBackend dispatch
     ├── platform.py               # BuddyPlatformAdapter (extends BasePlatformAdapter)
     ├── ble_central.py            # BLE Central (bleak, macOS CoreBluetooth)
     ├── json_codec.py             # NUS JSON encode/decode
     ├── http_server.py            # HTTP server (:8765)
-    ├── approval_relay.py         # Approval Relay (:8766)
-    ├── http_client.py            # HTTP client (for Hermes → Bridge calls)
-    └── main.py                   # Bridge entry point
+    ├── http_client.py            # HTTP client
+    ├── approval_relay.py         # Approval Relay (:8766, Hermes only)
+    └── backends/                 # Platform backends
+        ├── __init__.py           # PlatformBackend abstract base class
+        ├── hermes_backend.py     # Hermes resolution (internal + relay)
+        └── bitfun_backend.py     # BitFun resolution (HTTP callback)
 ```
 
 ## References
 
 - Hermes PR #16776: `pre_approval_request` / `post_approval_response` hooks
 - Hermes PR #11816: `pre_tool_call {"action": "approve"}` directive (optional, OPEN)
-- Hermes `platform_registry`: `gateway/platform_registry.py` (IRC plugin is the reference implementation)
+- Hermes `platform_registry`: `gateway/platform_registry.go`
+- BitFun `ToolPipeline`: `confirmation_channels` / `confirm_tool()` / `reject_tool()` in `src/crates/core/src/agentic/tools/pipeline/tool_pipeline.rs`
+- BitFun `EventSubscriber`: `src/crates/core/src/agentic/events/router.rs`
 - Claude Desktop Buddy firmware: `anthropics/claude-desktop-buddy`
 
 ## License
